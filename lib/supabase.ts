@@ -15,4 +15,5 @@ export type Expense = {
   date: string;
   amount: number;
   description: string;
+  user_id: string;
 };
