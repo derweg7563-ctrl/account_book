@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { supabase, type Expense } from "@/lib/supabase";
 
@@ -12,44 +12,36 @@ const fieldClass =
 const buttonClass =
   "h-14 w-full touch-manipulation rounded-xl bg-[#1d1d1f] text-lg font-medium text-white transition-colors hover:bg-[#3a3a3c] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#1d1d1f] disabled:cursor-not-allowed disabled:bg-[#d2d2d7] sm:h-12 sm:text-base";
 
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+};
+
+const welcome: ChatMessage = {
+  id: "welcome",
+  role: "assistant",
+  text: "지출을 말해 주세요. 예: 어제 점심 9000원",
+};
+
 export default function Home() {
   const [session, setSession] = useState<Session | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [authMode, setAuthMode] = useState<"sign-in" | "sign-up">("sign-in");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [date, setDate] = useState("");
-  const [amount, setAmount] = useState("");
-  const [description, setDescription] = useState("");
+  const [authMessage, setAuthMessage] = useState("");
+  const [authSaving, setAuthSaving] = useState(false);
   const [expenses, setExpenses] = useState<Expense[]>([]);
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [editDate, setEditDate] = useState("");
-  const [editAmount, setEditAmount] = useState("");
-  const [editDescription, setEditDescription] = useState("");
-  const [message, setMessage] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-
+  const [messages, setMessages] = useState<ChatMessage[]>([welcome]);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+  const threadRef = useRef<HTMLDivElement>(null);
   const total = useMemo(
     () => expenses.reduce((sum, item) => sum + item.amount, 0),
     [expenses],
   );
-
-  async function loadExpenses(userId: string) {
-    const { data, error } = await supabase
-      .from("expense")
-      .select("id, created_at, date, amount, description, user_id")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .order("id", { ascending: false });
-
-    if (error) {
-      setMessage("지출 내역을 불러오지 못했습니다.");
-      return;
-    }
-
-    setExpenses(data ?? []);
-  }
 
   useEffect(() => {
     let active = true;
@@ -58,7 +50,6 @@ export default function Home() {
       if (!active) return;
       setSession(data.session);
       setAuthReady(true);
-      if (!data.session) setLoading(false);
     });
 
     const { data } = supabase.auth.onAuthStateChange((_event, nextSession) => {
@@ -66,7 +57,7 @@ export default function Home() {
       setAuthReady(true);
       if (!nextSession) {
         setExpenses([]);
-        setLoading(false);
+        setMessages([welcome]);
       }
     });
 
@@ -81,10 +72,8 @@ export default function Home() {
     if (!userId) return;
 
     let active = true;
-    setLoading(true);
-
-    loadExpenses(userId).finally(() => {
-      if (active) setLoading(false);
+    loadExpenses(userId).then((rows) => {
+      if (active && rows) setExpenses(rows);
     });
 
     return () => {
@@ -92,10 +81,16 @@ export default function Home() {
     };
   }, [session?.user.id]);
 
+  useEffect(() => {
+    const thread = threadRef.current;
+    if (!thread) return;
+    thread.scrollTop = thread.scrollHeight;
+  }, [messages, sending]);
+
   async function handleAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setSaving(true);
-    setMessage("");
+    setAuthSaving(true);
+    setAuthMessage("");
 
     const credentials = { email: email.trim(), password };
     const result =
@@ -103,10 +98,10 @@ export default function Home() {
         ? await supabase.auth.signUp(credentials)
         : await supabase.auth.signInWithPassword(credentials);
 
-    setSaving(false);
+    setAuthSaving(false);
 
     if (result.error) {
-      setMessage(
+      setAuthMessage(
         authMode === "sign-up"
           ? "가입하지 못했습니다. 이메일과 비밀번호를 확인해 주세요."
           : "로그인하지 못했습니다. 이메일과 비밀번호를 확인해 주세요.",
@@ -115,7 +110,7 @@ export default function Home() {
     }
 
     if (authMode === "sign-up" && !result.data.session) {
-      setMessage("가입 메일을 보냈습니다. 메일의 링크를 누른 뒤 로그인해 주세요.");
+      setAuthMessage("가입 메일을 보냈습니다. 메일의 링크를 누른 뒤 로그인해 주세요.");
       setAuthMode("sign-in");
       setPassword("");
     }
@@ -123,342 +118,242 @@ export default function Home() {
 
   async function handleSignOut() {
     await supabase.auth.signOut();
-    setDate("");
-    setAmount("");
-    setDescription("");
-    setEditingId(null);
-    setMessage("");
+    setDraft("");
+    setAuthMessage("");
   }
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handleSend(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const text = draft.trim();
     const userId = session?.user.id;
-    const parsed = Number(amount.replaceAll(",", "").trim());
+    if (!text || !userId || sending) return;
 
-    if (!userId || !date || !description.trim() || !Number.isFinite(parsed) || parsed <= 0) {
-      setMessage("날짜, 금액, 내용을 모두 올바르게 입력해 주세요.");
-      return;
+    setDraft("");
+    setSending(true);
+    setMessages((current) => [...current, { id: crypto.randomUUID(), role: "user", text }]);
+
+    try {
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text }),
+      });
+      const raw = await response.text();
+      let body: { reply?: string; error?: string } = {};
+      try {
+        body = JSON.parse(raw) as { reply?: string; error?: string };
+      } catch {
+        body = { error: "서버 응답을 읽지 못했습니다." };
+      }
+      const reply = body.reply || body.error || "답변을 받지 못했습니다.";
+      setMessages((current) => [...current, { id: crypto.randomUUID(), role: "assistant", text: reply }]);
+
+      if (response.ok) {
+        const rows = await loadExpenses(userId);
+        if (rows) setExpenses(rows);
+      }
+    } catch {
+      setMessages((current) => [
+        ...current,
+        { id: crypto.randomUUID(), role: "assistant", text: "연결하지 못했습니다. 다시 시도해 주세요." },
+      ]);
+    } finally {
+      setSending(false);
     }
-
-    setSaving(true);
-    setMessage("");
-
-    const { error } = await supabase.from("expense").insert({
-      date,
-      amount: Math.round(parsed),
-      description: description.trim(),
-      user_id: userId,
-    });
-
-    if (error) {
-      setSaving(false);
-      setMessage("저장하지 못했습니다. 다시 시도해 주세요.");
-      return;
-    }
-
-    await loadExpenses(userId);
-    setDate("");
-    setAmount("");
-    setDescription("");
-    setSaving(false);
-    setMessage("저장되었습니다.");
-  }
-
-  function startEdit(expense: Expense) {
-    setEditingId(expense.id);
-    setEditDate(expense.date);
-    setEditAmount(String(expense.amount));
-    setEditDescription(expense.description);
-    setMessage("");
-  }
-
-  async function saveEdit(id: number) {
-    const userId = session?.user.id;
-    const parsed = Number(editAmount.replaceAll(",", "").trim());
-
-    if (!userId || !editDate || !editDescription.trim() || !Number.isFinite(parsed) || parsed <= 0) {
-      setMessage("날짜, 금액, 내용을 모두 올바르게 입력해 주세요.");
-      return;
-    }
-
-    setSaving(true);
-    setMessage("");
-
-    const { error } = await supabase
-      .from("expense")
-      .update({
-        date: editDate,
-        amount: Math.round(parsed),
-        description: editDescription.trim(),
-      })
-      .eq("id", id)
-      .eq("user_id", userId);
-
-    setSaving(false);
-
-    if (error) {
-      setMessage("수정하지 못했습니다. 다시 시도해 주세요.");
-      return;
-    }
-
-    setEditingId(null);
-    await loadExpenses(userId);
-    setMessage("수정되었습니다.");
   }
 
   async function removeExpense(id: number) {
     const userId = session?.user.id;
-    if (!userId) return;
+    if (!userId || deletingId !== null) return;
     if (!window.confirm("이 지출을 삭제할까요?")) return;
 
-    setSaving(true);
-    setMessage("");
-
+    setDeletingId(id);
     const { error } = await supabase.from("expense").delete().eq("id", id).eq("user_id", userId);
-
-    setSaving(false);
+    setDeletingId(null);
 
     if (error) {
-      setMessage("삭제하지 못했습니다. 다시 시도해 주세요.");
+      setMessages((current) => [
+        ...current,
+        { id: crypto.randomUUID(), role: "assistant", text: "삭제하지 못했습니다. 다시 시도해 주세요." },
+      ]);
       return;
     }
 
-    if (editingId === id) setEditingId(null);
-    await loadExpenses(userId);
-    setMessage("삭제되었습니다.");
+    const rows = await loadExpenses(userId);
+    if (rows) setExpenses(rows);
   }
 
   return (
-    <div className="min-h-full overflow-x-hidden bg-[#f5f5f7] px-5 py-10 text-[#1d1d1f] sm:px-8 sm:py-16">
-      <div className="mx-auto flex w-full max-w-xl flex-col gap-10 sm:gap-14">
-        <header className="flex items-start justify-between gap-6">
-          <div>
-            <p className="text-base text-[#6e6e73] sm:text-sm">오늘도 가볍게 기록하기</p>
-            <h1 className="mt-3 text-4xl font-semibold tracking-tight">나의 스마트 가계부</h1>
-          </div>
-          {session ? (
+    <div className="min-h-dvh bg-[#f5f5f7] text-[#1d1d1f]">
+      {!authReady ? (
+        <main className="mx-auto flex min-h-dvh w-full max-w-xl items-center px-5">
+          <p className="text-base text-[#6e6e73] sm:text-sm">로그인 상태를 확인하고 있습니다.</p>
+        </main>
+      ) : !session ? (
+        <main className="mx-auto flex min-h-dvh w-full max-w-xl flex-col justify-center gap-10 px-5 py-10">
+          <header>
+            <h1 className="text-4xl font-semibold tracking-tight">AI 가계부 챗봇</h1>
+          </header>
+          <form className="flex flex-col gap-8 rounded-[28px] bg-white px-5 py-7 sm:gap-6 sm:px-10 sm:py-10" onSubmit={handleAuth}>
+            <div>
+              <h2 className="text-xl font-medium sm:text-lg">{authMode === "sign-in" ? "로그인" : "회원가입"}</h2>
+              <p className="mt-2 text-base text-[#6e6e73] sm:text-sm">로그인해야 가계부를 사용할 수 있습니다.</p>
+            </div>
+            <label className="flex min-w-0 flex-col gap-3 text-base font-medium text-[#6e6e73] sm:gap-2 sm:text-sm">
+              이메일
+              <input
+                type="email"
+                name="email"
+                autoComplete="email"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                required
+                className={fieldClass}
+              />
+            </label>
+            <label className="flex min-w-0 flex-col gap-3 text-base font-medium text-[#6e6e73] sm:gap-2 sm:text-sm">
+              비밀번호
+              <input
+                type="password"
+                name="password"
+                autoComplete={authMode === "sign-in" ? "current-password" : "new-password"}
+                minLength={6}
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                required
+                className={fieldClass}
+              />
+            </label>
+            <button type="submit" disabled={authSaving} className={buttonClass}>
+              {authSaving ? "처리 중..." : authMode === "sign-in" ? "로그인" : "가입하기"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAuthMode(authMode === "sign-in" ? "sign-up" : "sign-in");
+                setAuthMessage("");
+              }}
+              className="text-left text-base text-[#6e6e73] hover:text-[#1d1d1f] sm:text-sm"
+            >
+              {authMode === "sign-in" ? "계정이 없으면 가입하기" : "이미 계정이 있으면 로그인"}
+            </button>
+            {authMessage ? (
+              <p className="text-base text-[#6e6e73] sm:text-sm" role="status">
+                {authMessage}
+              </p>
+            ) : null}
+          </form>
+        </main>
+      ) : (
+        <div className="mx-auto flex h-dvh w-full max-w-3xl flex-col">
+          <header className="flex items-center justify-between gap-4 px-5 py-4">
+            <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">AI 가계부 챗봇</h1>
             <button
               type="button"
               onClick={handleSignOut}
-              className="mt-3 shrink-0 text-base text-[#6e6e73] hover:text-[#1d1d1f] sm:text-sm"
+              className="shrink-0 text-base text-[#6e6e73] hover:text-[#1d1d1f] sm:text-sm"
             >
               로그아웃
             </button>
-          ) : null}
-        </header>
+          </header>
 
-        <main className="w-full rounded-[28px] bg-white px-5 py-7 sm:px-10 sm:py-10">
-          {!authReady ? (
-            <p className="text-base text-[#6e6e73] sm:text-sm">로그인 상태를 확인하고 있습니다.</p>
-          ) : !session ? (
-            <form className="flex flex-col gap-8 sm:gap-6" onSubmit={handleAuth}>
-              <div>
-                <h2 className="text-xl font-medium sm:text-lg">
-                  {authMode === "sign-in" ? "로그인" : "회원가입"}
-                </h2>
-                <p className="mt-2 text-base text-[#6e6e73] sm:text-sm">
-                  내 지출만 보고 기록할 수 있습니다.
-                </p>
-              </div>
-              <label className="flex min-w-0 flex-col gap-3 text-base font-medium text-[#6e6e73] sm:gap-2 sm:text-sm">
-                이메일
-                <input
-                  type="email"
-                  name="email"
-                  autoComplete="email"
-                  value={email}
-                  onChange={(event) => setEmail(event.target.value)}
-                  required
-                  className={fieldClass}
-                />
-              </label>
-              <label className="flex min-w-0 flex-col gap-3 text-base font-medium text-[#6e6e73] sm:gap-2 sm:text-sm">
-                비밀번호
-                <input
-                  type="password"
-                  name="password"
-                  autoComplete={authMode === "sign-in" ? "current-password" : "new-password"}
-                  minLength={6}
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
-                  required
-                  className={fieldClass}
-                />
-              </label>
-              <button type="submit" disabled={saving} className={buttonClass}>
-                {saving ? "처리 중..." : authMode === "sign-in" ? "로그인" : "가입하기"}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setAuthMode(authMode === "sign-in" ? "sign-up" : "sign-in");
-                  setMessage("");
-                }}
-                className="text-left text-base text-[#6e6e73] hover:text-[#1d1d1f] sm:text-sm"
+          <section className="px-5" aria-label="저장된 지출">
+            <p className="mb-3 text-base text-[#6e6e73] sm:text-sm">
+              합계{" "}
+              <span className="numeric text-2xl font-semibold tracking-tight text-[#1d1d1f] sm:text-xl">
+                {currency.format(total)}원
+              </span>
+            </p>
+            {expenses.length === 0 ? (
+              <p className="rounded-2xl bg-white px-4 py-4 text-base text-[#6e6e73] sm:text-sm">
+                아직 저장된 지출이 없습니다.
+              </p>
+            ) : (
+              <ul className="flex gap-3 overflow-x-auto pb-2">
+                {expenses.map((expense) => (
+                  <li
+                    key={expense.id}
+                    className="flex w-56 shrink-0 flex-col rounded-2xl bg-white px-4 py-4 sm:w-64"
+                  >
+                    <p className="text-base text-[#6e6e73] sm:text-sm">{formatDate(expense.date)}</p>
+                    <p className="numeric mt-2 text-2xl font-semibold tracking-tight">
+                      {currency.format(expense.amount)}
+                      <span className="ml-1 text-base font-medium text-[#6e6e73] sm:text-sm">원</span>
+                    </p>
+                    <p className="mt-2 line-clamp-2 text-lg sm:text-base">{expense.description}</p>
+                    <button
+                      type="button"
+                      onClick={() => removeExpense(expense.id)}
+                      disabled={deletingId === expense.id}
+                      className="mt-4 self-start text-base text-[#6e6e73] hover:text-[#1d1d1f] disabled:text-[#d2d2d7] sm:text-sm"
+                    >
+                      삭제
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          <div ref={threadRef} className="mt-4 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-5 py-4">
+            {messages.map((message) => (
+              <p
+                key={message.id}
+                className={
+                  message.role === "user"
+                    ? "ml-auto max-w-[80%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-[#1d1d1f] px-4 py-3 text-lg text-white sm:text-base"
+                    : "mr-auto max-w-[80%] whitespace-pre-wrap rounded-2xl rounded-bl-md bg-white px-4 py-3 text-lg sm:text-base"
+                }
               >
-                {authMode === "sign-in" ? "계정이 없으면 가입하기" : "이미 계정이 있으면 로그인"}
-              </button>
-              {message ? (
-                <p className="text-base text-[#6e6e73] sm:text-sm" role="status">
-                  {message}
-                </p>
-              ) : null}
-            </form>
-          ) : (
-            <>
-              <p className="text-base text-[#6e6e73] sm:text-sm">{session.user.email}</p>
-              <form className="mt-8 flex flex-col gap-8 sm:gap-6" onSubmit={handleSubmit}>
-                <div className="grid grid-cols-1 gap-8 sm:grid-cols-2 sm:gap-6">
-                  <label className="flex min-w-0 flex-col gap-3 text-base font-medium text-[#6e6e73] sm:gap-2 sm:text-sm">
-                    날짜
-                    <input
-                      type="date"
-                      name="date"
-                      value={date}
-                      onChange={(event) => setDate(event.target.value)}
-                      required
-                      className={fieldClass}
-                    />
-                  </label>
-                  <label className="flex min-w-0 flex-col gap-3 text-base font-medium text-[#6e6e73] sm:gap-2 sm:text-sm">
-                    금액
-                    <input
-                      type="number"
-                      name="amount"
-                      inputMode="numeric"
-                      min="1"
-                      step="1"
-                      placeholder="0"
-                      value={amount}
-                      onChange={(event) => setAmount(event.target.value)}
-                      required
-                      className={`${fieldClass} numeric`}
-                    />
-                  </label>
-                </div>
+                {message.text}
+              </p>
+            ))}
+            {sending ? (
+              <p className="mr-auto rounded-2xl rounded-bl-md bg-white px-4 py-3 text-lg text-[#6e6e73] sm:text-base">
+                기록하는 중...
+              </p>
+            ) : null}
+          </div>
 
-                <label className="flex min-w-0 flex-col gap-3 text-base font-medium text-[#6e6e73] sm:gap-2 sm:text-sm">
-                  내용
-                  <input
-                    type="text"
-                    name="description"
-                    placeholder="예: 점심 식사"
-                    value={description}
-                    onChange={(event) => setDescription(event.target.value)}
-                    required
-                    className={fieldClass}
-                  />
-                </label>
-
-                <button type="submit" disabled={saving} className={buttonClass}>
-                  {saving ? "저장 중..." : "저장하기"}
-                </button>
-                {message ? (
-                  <p className="text-base text-[#6e6e73] sm:text-sm" role="status">
-                    {message}
-                  </p>
-                ) : null}
-              </form>
-
-              <section className="mt-14 sm:mt-16">
-                <h2 className="text-xl font-medium sm:text-lg">지출 내역</h2>
-                <p className="numeric mt-3 text-4xl font-semibold tracking-tight sm:text-3xl">
-                  {currency.format(total)}
-                  <span className="ml-1 text-xl font-medium text-[#6e6e73] sm:text-lg">원</span>
-                </p>
-                {loading ? (
-                  <p className="mt-8 text-base text-[#6e6e73] sm:text-sm">
-                    지출 내역을 불러오는 중입니다.
-                  </p>
-                ) : expenses.length === 0 ? (
-                  <p className="mt-8 text-base text-[#6e6e73] sm:text-sm">
-                    아직 저장된 지출이 없습니다.
-                  </p>
-                ) : (
-                  <ul className="mt-8 flex flex-col">
-                    {expenses.map((expense) => (
-                      <li key={expense.id} className="py-5">
-                        {editingId === expense.id ? (
-                          <div className="flex flex-col gap-6">
-                            <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
-                              <input
-                                type="date"
-                                aria-label="날짜 수정"
-                                value={editDate}
-                                onChange={(event) => setEditDate(event.target.value)}
-                                className={fieldClass}
-                              />
-                              <input
-                                type="number"
-                                aria-label="금액 수정"
-                                min="1"
-                                step="1"
-                                value={editAmount}
-                                onChange={(event) => setEditAmount(event.target.value)}
-                                className={`${fieldClass} numeric`}
-                              />
-                            </div>
-                            <input
-                              type="text"
-                              aria-label="내용 수정"
-                              value={editDescription}
-                              onChange={(event) => setEditDescription(event.target.value)}
-                              className={fieldClass}
-                            />
-                            <div className="flex gap-6 text-base sm:text-sm">
-                              <button
-                                type="button"
-                                disabled={saving}
-                                onClick={() => saveEdit(expense.id)}
-                                className="text-[#1d1d1f] hover:text-[#3a3a3c] disabled:text-[#d2d2d7]"
-                              >
-                                저장
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setEditingId(null)}
-                                className="text-[#6e6e73] hover:text-[#1d1d1f]"
-                              >
-                                취소
-                              </button>
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="flex items-baseline justify-between gap-6">
-                            <div className="min-w-0">
-                              <p className="break-words text-lg sm:text-base">{expense.description}</p>
-                              <p className="mt-1 text-base text-[#6e6e73] sm:text-sm">{expense.date}</p>
-                              <div className="mt-3 flex gap-5 text-base text-[#6e6e73] sm:text-sm">
-                                <button
-                                  type="button"
-                                  onClick={() => startEdit(expense)}
-                                  className="hover:text-[#1d1d1f]"
-                                >
-                                  수정
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => removeExpense(expense.id)}
-                                  className="hover:text-[#1d1d1f]"
-                                >
-                                  삭제
-                                </button>
-                              </div>
-                            </div>
-                            <p className="numeric shrink-0 text-2xl font-medium sm:text-xl">
-                              {currency.format(expense.amount)}
-                            </p>
-                          </div>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </section>
-            </>
-          )}
-        </main>
-      </div>
+          <form className="flex items-center gap-2 px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-2" onSubmit={handleSend}>
+            <label className="min-w-0 flex-1">
+              <span className="sr-only">메시지</span>
+              <input
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                placeholder="어제 점심 9000원"
+                maxLength={500}
+                className="h-14 w-full rounded-full border-0 bg-white px-5 text-lg outline-none placeholder:text-[#a1a1a6] focus:bg-[#f2f2f4] sm:h-12 sm:text-base"
+              />
+            </label>
+            <button
+              type="submit"
+              disabled={sending || !draft.trim()}
+              className="h-14 shrink-0 touch-manipulation rounded-full bg-[#1d1d1f] px-5 text-lg font-medium text-white transition-colors hover:bg-[#3a3a3c] disabled:bg-[#d2d2d7] sm:h-12 sm:text-base"
+            >
+              전송
+            </button>
+          </form>
+        </div>
+      )}
     </div>
   );
+}
+
+async function loadExpenses(userId: string) {
+  const { data, error } = await supabase
+    .from("expense")
+    .select("id, created_at, date, amount, description, user_id")
+    .eq("user_id", userId)
+    .order("date", { ascending: false })
+    .order("created_at", { ascending: false });
+
+  if (error) return null;
+  return data ?? [];
+}
+
+function formatDate(value: string) {
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return value;
+  return `${year}년 ${month}월 ${day}일`;
 }
